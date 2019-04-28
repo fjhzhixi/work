@@ -49,7 +49,7 @@ symbol:         .frame  sp, framesize, rpc
 
 1. C函数之间的调用 : 
 
-   所有的参数传递以及返回值得维护由编译器隐式的实现,不需要考虑
+   所有的参数传递以及返回值的维护由编译器隐式的实现,不需要考虑
 
 2. MIPS汇编之间的调用
 
@@ -71,13 +71,122 @@ symbol:         .frame  sp, framesize, rpc
      1. 可以选择盲目的将`$a0-$a3`的写入栈中,也可以不写(取决于该汇编函数的功能)
      2. **前4个参数从寄存器获得,之后的参数从栈中获得**
 
-4. MIPS汇编函数调用C函数
+4. MIPS汇编函数调用C函数 :
+
+   * 调用者(即MIPS汇编代码) : 将参数按照C函数的定义从左向右的顺序存入`$a0-$a3`寄存器中,如果要求在调用结束后保存某些寄存器则要使用栈区保存(**注意`ra`寄存器是一定要保存的,并在调用结束之后要恢复**),然后直接跳转到C函数的入口地址处即可
+
+     注 : 具体实现方法为**在.S文件中使用`extern`外联定义C函数`c_method()`,然后直接使用`jal c_method`即可**(因为`jal`会写入返回地址到`$ra`中,而C函数在最后会自动调用`jr ra`)
+
+   * 被调用者(C函数) : 不用做任何特殊处理,正常编写即可
 
 ## 异常处理流程
 
+**时钟中断,系统调用,以及在指令执行中出现的错误都作为一种异常处理**
 
+### 异常处理程序地址
 
-# 走进lab4
+```c
+//tools/sces0_3.lds
+SECTIONS
+{
+  . = 0x80000080;
+  .except_vec3 : {
+	*(.text.exc_vec3)
+  }// 可见我们将所有exc_vec3代码段加载到了0x80000080地址处,而这些代码就是最基本的异常处理程序(异常分发程序),实际上该处的代码并没有真正处理异常,只是根据异常类型将其分发给特定的异常处理程序
+  // other code
+}
+```
+
+这个地址`0x80000080`是当异常发生时`CPU`将`PC`跳转到的地址(由`MIPS R3000 CPU`的设计决定的)
+
+即异常发生时 : **首先是硬件发挥作用,即CPU进行以下行为** : 
+
+1. 设置`EPC`为异常处理结束后重新开始的程序地址
+2. 设置`CP0`的`SR`寄存器中的`EXL`位使得`CPU`进入内核态**禁止中断**
+3. 设置`CP0`的`CAUSE`寄存器编码为异常产生原因
+4. 设置`PC`值为异常处理程序的入口地址(在此处即`0x80000080`)
+
+### 异常类型注册表
+
+```c
+//lib/traps.c
+extern void handle_int();
+extern void handle_reserved();
+extern void handle_tlb();
+extern void handle_sys();
+extern void handle_mod();
+// 以上具体的实现在外部函数实现
+/* 这个数组即是异常向量
+ * 向量下标与CAUSE寄存器中的异常类型编号对用
+ * 向量每一项为对应异常种类的处理程序的入口地址
+*/
+unsigned long exception_handlers[32];
+void trap_init(){
+	int i;
+	for(i=0;i<32;i++)
+	set_except_vector(i, handle_reserved);
+	set_except_vector(0, handle_int);
+	set_except_vector(1, handle_mod);
+	set_except_vector(2, handle_tlb);
+	set_except_vector(3, handle_tlb);
+	set_except_vector(8, handle_sys);
+}
+void *set_except_vector(int n, void * addr){
+	unsigned long handler=(unsigned long)addr;
+	unsigned long old_handler=exception_handlers[n];
+	exception_handlers[n]=handler;
+	return (void *)old_handler;
+}
+```
+
+注 : 异常类型在`CAUSE`寄存器中对应的编码值
+
+![](image/handle_kind.png)
+
+### 异常分发程序
+
+异常发生时**直接跳转到**的函数地址
+
+* 作用 : 根据`CAUSE`寄存器的值判断异常类型并跳转到对应的处理程序去
+
+* 实现 :
+
+  ```c
+  //boot/start.S
+  .section .text.exc_vec3
+  NESTED(except_vec3, 0, sp) // 非叶子函数因为要跳转到
+  	.set	noat
+  	.set	noreorder
+  1:	//j	1b
+  	nop
+  	mfc0	k1,CP0_CAUSE	    //$k1中存储CAUSE寄存器中的值
+  	andi	k1,0x7c			   //$k1中存储异常类型的编码值,具体见下文
+  	la	k0,exception_handlers	//$k0中存储异常向量的起始地址(即数组的基址)
+  	addu	k0,k1			   //$k0 + $k1 即基址+偏移获得存储(异常处理程序的入口地址)的地址放入$k0中
+  	lw	k0,(k0)				   //从该地址中取出异常处理程序的入口地址
+  	NOP
+  	jr	k0					  //跳转到对应的异常处理程序
+  	nop
+  	END(except_vec3)
+  ```
+
+  注 : 对`andi k1,0x7c`的理解
+
+  1. `CAUSE`寄存器结构如下 :
+
+     ![](image\cause_register.png)
+
+  2. `0x7c = 0x0111_1100`,与该数按位与就是获得`2-6`位的值,从上图可知就是`Exc Code`的值,所以该操作可以获得异常类型的编码值
+
+* 在异常分发完之后就是实际的处理程序的运行了
+
+  处理异常完成之后即可**返回`EPC`保存的地址**
+
+### 流程图示
+
+![](image\epc.png)
+
+# 走进lab4 
 
 ## 系统调用的基本流程
 
@@ -124,7 +233,7 @@ symbol:         .frame  sp, framesize, rpc
       }
       ````
 
-      即用户准备好必要的信息,然后**包装一层**在将第一个参数设置为**系统调用号**,然后内核根据系统调用号的值(**偏移**)决定**真正执行功能的函数的入口地址**
+      即用户准备好必要的信息,然后**包装一层**将第一个参数设置为**系统调用号**,然后内核根据系统调用号的值(**偏移**)决定**真正执行功能的函数的入口地址**
 
       这些系统调用号以一个注册表的形式定义在头文件中 :
 
@@ -162,16 +271,12 @@ symbol:         .frame  sp, framesize, rpc
       sw	a1,4(sp)
       sw	a2,8(sp)
       sw	a3,12(sp)
+      // 上面的保存在该函数中没有明确作用.....
       move	v0, a0
       syscall
       jr	ra
       END(msyscall)
       ```
-
-      
-
-
-
 
 
 # 问题
