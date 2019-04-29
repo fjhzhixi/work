@@ -203,7 +203,7 @@ void *set_except_vector(int n, void * addr){
 
 ### 代码细节
 
-1. 用户空间的行为 : 
+1. 用户态的行为 : 
 
    1. 调用`syscall_*`函数,等待返回值(如果有的话)
 
@@ -271,95 +271,138 @@ void *set_except_vector(int n, void * addr){
       ```c
       //user/syscall_wrap.S
       LEAF(msyscall)	//说明该函数是一个全局叶子函数,不需要调用其他函数
-      sw	a0,0(sp)
-      sw	a1,4(sp)
-      sw	a2,8(sp)
-      sw	a3,12(sp)
+      // sw	a0,0(sp)
+      // sw	a1,4(sp)
+      // sw	a2,8(sp)
+      // sw	a3,12(sp)
+      // move	v0, a0
       // 将参数存入已经在C函数调用汇编函数时分配好的栈空间中
-      // 我认为目的就是稳一手,防止在异常处理程序中使用这些寄存器破坏数据(反正空间都已经在那了)
-      move	v0, a0
+      // 我认为目的就是稳一手,防止在异常分发程序中使用这些寄存器破坏数据(反正空间都已经在那了)
+      // 稳一手把自己稳炸了,不要写上面这些!!!!
       syscall	//触发系统调用异常
       jr	ra
       END(msyscall)
-      ```
-
-      * **当调用`syscall`时发生了什么 : **
-
-        触发**系统调用异常**按照**上面描述的异常处理流程**将该异常分发到**系统调用处理程序**
-
-      * 上述的保存寄存器代码段是依据于系统调用约定 :
-
-        1. 系统调用号放入`$v0`
+   ```
+   
+   * **当调用`syscall`时发生了什么 : **
+   
+     触发**系统调用异常**按照**上面描述的异常处理流程**将该异常分发到**系统调用处理程序**
+   
+   * 上述的保存寄存器代码段是依据于系统调用约定 :
+   
+        1. ~~系统调用号放入`$v0`~~(课上测试不放我有什么办法)
         2. 参数的传递按照`o32ABI`的约定进行 :
-           * 在`syscall_lib.c`中C函数调用`msyscall(SYS_*, arg1,...arg5)`时依据约定栈区划定24字节空间,前4个参数通过`$a0-$a3`传递,后两个参数通过栈区传递
+        * 在`syscall_lib.c`中C函数调用`msyscall(SYS_*, arg1,...arg5)`时**依据约定栈区划定24字节空间,前4个参数通过`$a0-$a3`传递,后两个参数通过栈区传递**
+           * ~~我为什么不能把所有的参数都放进栈中,为什么,艹~~
 
-   3. 接下来运行**系统调用异常处理程序**
+2. 内核态的行为
+
+   1. 接下来运行**系统调用异常处理程序**
 
       ```c
       //lib/syscall.S
       NESTED(handle_sys,TF_SIZE, sp)
       
+      //所有的异常处理的第一步都是保存现场(关于保存现场详情移步lab3)
       SAVE_ALL	//保存运行现场,即将寄存器全部压栈
+      // 在上述保存过程中
       CLI		    //关闭中断
       
       //1: j 1b
       nop
       .set at
+      
       lw t1, TF_EPC(sp)
-      lw v0, TF_REG2(sp)
-      
-      subu v0, v0, __SYSCALL_BASE
-      sltiu t0, v0, __NR_SYSCALLS+1
-      
       addiu t1, 4
       sw	t1, TF_EPC(sp)
-      beqz	t0,  illegal_syscall//undef
+      //从保存的现场中取出EPC再+4之后存回,即为异常处理结束之后的重新开始运行的PC值
+          
+      //从保存的现场中取出$4即$a0的值存入a0当中去
+      lw a0, TF_REG4(sp)	//a0即保存的系统调用号
+      addiu a0, a0, -SYSCALL_BASE	//获得偏移,即获得了系统调用的具体种类
+      sll	t0, a0,2
+      la	t1, sys_call_table	//t1为系统调用注册表(即下文的入口地址表)的起始地址
+      addu	t1, t1, t0		//根据偏移得到(具体系统调用函数的入口地址)的地址
+      lw	t2, 0(t1)			//取出入口地址放入$t2
+      lw	t0,TF_REG29(sp)		//取出保存现场保存的用户态下的栈指针放入$t0
+      
+      // 注意参数的不同分布
+      // 前4个参数由于是通过$ai来传递的,所以在保存现场时被存在TF区域,要从这里恢复
+      // 后两个参数本身就是通过栈来传递的,所以在用户的sp栈指针所指的栈中,而这个栈指针已经取到$t0中去了
+      lw t3, 16($t0)
+      lw t4, 20($t0)
+          
+      //恢复$a0-$a3参数
+      lw a0, TF_REG4(sp)
+      lw a1, TF_REG5(sp)
+      lw a2, TF_REG6(sp)
+      lw a3, TF_REG7(sp)
+          
+      //然后准备参数,调用对应的系统调用(调用C函数)
+      //参数 : 前4个通过寄存器传,后面两个通过sp栈区传
+      //但是在栈区还是要留前4个参数的空间,只不过什么都不存(我也不知道为什么,艹)
+      addiu sp, sp, -24
+      sw t3, 16(sp)
+      sw t4, 20(sp)
+      
+      //调用函数
+      jalr t2
       nop
-      sll	t0, v0,2
-      la	t1, sys_call_table
-      addu	t1, t0
-      lw	t2, (t1)
-      beqz	t2, illegal_syscall//undef
-      nop
-      lw	t0,TF_REG29(sp)
       
-      lw	t1, (t0)
-      lw	t3, 4(t0)
-      lw	t4, 8(t0)
-      lw	t5, 12(t0)
-      lw	t6, 16(t0)
-      lw	t7, 20(t0)
-      
-      subu	sp, 20
-      
-      sw	t1, 0(sp)
-      sw	t3, 4(sp)
-      sw	t4, 8(sp)
-      sw	t5, 12(sp)
-      sw	t6, 16(sp)
-      sw	t7, 20(sp)
-      
-      move	a0, t1
-      move	a1, t3
-      move	a2, t4
-      move	a3, t5
-      	
-      jalr	t2
-      nop
-      
-      addu	sp, 20
-      
+      //恢复栈指针
+      addiu sp, sp, 24
+         
       sw	v0, TF_REG2(sp)
       
-      j	ret_from_exception//extern?
+      j	ret_from_exception
       nop
-      
-      illegal_syscall: j illegal_syscall
-      			nop
       END(handle_sys)
+        
+      // 系统调用注册表    
+      sys_call_table:
+      .align 2
+          .word sys_putchar	//每一个word存储该系统调用函数的入口地址
+          .word sys_getenvid
+          .word sys_yield
+          .word sys_env_destroy
+          .word sys_set_pgfault_handler
+          .word sys_mem_alloc
+          .word sys_mem_map
+          .word sys_mem_unmap
+          .word sys_env_alloc
+          .word sys_set_env_status
+          .word sys_set_trapframe
+          .word sys_panic
+          .word sys_ipc_can_send
+          .word sys_ipc_recv
+          .word sys_cgetc
       ```
 
-      
+      **参数分布图示**
+
+      ![](OS-lab4\args.png)
+
+      下面我就想不通了 : 
+
+      * 在异常分发阶段只是使用了`$k0,$k1`寄存器
+      * 在进入系统调用异常处理程序即`handle_sys`已经关闭了时钟中断
+      * 在`SAVA_ALL`和恢复参数之间并没有使用`$a0-$a3`寄存器
+
+      所以这个保存现场+恢复在目前看来完全是无用操作,在最后设置参数时只需设置`args[4],args[5]`即可(实测可以跑)
+
+      我认为有以下考虑 :
+
+      1. 操作的统一性 : 处理异常第一件事就是保存现场
+      2. 后续扩展功能可能破坏寄存器
+      3. ~~课上测试换你文件~~
+
+   2. 接下来便是各种~~神奇~~的系统调用了
+
+#### 各种系统调用
+
+1. 
+
+
 
 # 问题
 
