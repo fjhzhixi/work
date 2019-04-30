@@ -127,11 +127,11 @@ void trap_init(){
 	int i;
 	for(i=0;i<32;i++)
 	set_except_vector(i, handle_reserved);
-	set_except_vector(0, handle_int);
-	set_except_vector(1, handle_mod);
-	set_except_vector(2, handle_tlb);
-	set_except_vector(3, handle_tlb);
-	set_except_vector(8, handle_sys);
+	set_except_vector(0, handle_int);	//时钟中断异常处理程序
+	set_except_vector(1, handle_mod);	//缺页异常处理程序
+	set_except_vector(2, handle_tlb);	
+	set_except_vector(3, handle_tlb);	//tlb确实异常处理
+	set_except_vector(8, handle_sys);	//系统调用异常处理
 }
 void *set_except_vector(int n, void * addr){
 	unsigned long handler=(unsigned long)addr;
@@ -700,14 +700,132 @@ void *set_except_vector(int n, void * addr){
 
 1. **硬件工作** : `CPU`根据虚拟地址查页表时页表项无效,触发异常,记录缺页异常类型,跳转到异常分发代码
 2. **软件工作** : 
-   1. 异常分发代码判断为缺页异常,跳转(鬼知道怎么跳转的)到缺页异常处理代码
+   1. 异常分发代码判断为缺页异常,跳转(~~极其隐蔽的一个跳转~~)到缺页异常处理代码
    2. **在微内核的设计当中内核不做具体的处理,具体的缺页重填代码在用户态实现**
    3. 用户态分配物理页,建立映射机制
    4. 异常中断返回,重新访问该地址,程序继续运行
 
 #### 代码实现
 
+1. **缺页异常的处理被分发到`handle_mod`函数处理**(具体的跳转流程详见异常类型注册表与异常分发程序)
 
+   这个`handle_mod`函数藏得很深,使用汇编宏定义来定义
+
+   在这个函数中实际上**保存现场关闭中断**之后跳转到实际处理函数`page_fault_handler`中
+
+   ```c
+   //lib/genex.S
+   //定义全局的异常处理程序的宏定义
+   /*
+    * exception为异常的类型(tlb/mod),函数名为handle_\exception(对应异常类型注册表中的handle_tlb,handle_mod)
+    * handler为实际处理该异常的函数,即在该程序内部要跳转到的程序
+   */
+   .macro	BUILD_HANDLER exception handler clear
+   	.align	5
+   	NESTED(handle_\exception, TF_SIZE, sp)  
+   	nop
+   	SAVE_ALL				
+   	__build_clear_\clear
+   	.set	at
+   	move	a0, sp
+   	jal	\handler
+   	nop
+   	j	ret_from_exception
+   	nop
+   	END(handle_\exception)
+   .endm
+   //该函数的作用是根据CP0状态跳转到TLB重填代码或者页表重填代码
+   NESTED(do_refill,0 , sp)
+   	.extern	mCONTEXT
+   1:			
+   	nop
+   	lw		k1,mCONTEXT
+   	and		k1,0xfffff000
+   	mfc0	k0,CP0_BADVADDR
+   	srl		k0,20
+   	and		k0,0xfffffffc
+   	addu	k0,k1
+   	lw		k1,0(k0)
+   	nop
+   	move	t0,k1
+   	and		t0,0x0200
+   	beqz	t0,NOPAGE
+   	nop
+   	and		k1,0xfffff000
+   	mfc0	k0,CP0_BADVADDR
+   	srl		k0,10
+   	and		k0,0xfffffffc
+   	and		k0,0x00000fff
+   	addu	k0,k1
+   	or		k0,0x80000000
+   	lw		k1,0(k0)
+   	nop
+   	move	t0,k1
+   	and		t0,0x0200
+   	beqz	t0,NOPAGE
+   	nop
+   	move	k0,k1
+   	and		k0,0x1
+   	beqz	k0,NoCOW
+   	nop
+   	and		k1,0xfffffbff
+   NoCOW:
+   	mtc0	k1,CP0_ENTRYLO0
+   	nop
+   	tlbwr
+   	j		2f
+   	nop
+   NOPAGE:
+   	nop
+   	mfc0	a0,CP0_BADVADDR
+   	lw		a1,mCONTEXT
+   	nop
+   	sw	 	ra,tlbra
+   	jal		pageout
+   	nop
+   	nop
+   	lw		ra,tlbra
+   	nop
+   	j	1b
+   2:	nop
+   	jr		ra
+   	nop
+   END(do_refill)
+   BUILD_HANDLER reserved do_reserved cli	//定义全局函数handle_resereverd
+   BUILD_HANDLER tlb	do_refill	cli	   //定义全局函数handle_tlb
+   BUILD_HANDLER mod	page_fault_handler cli	//定义全局函数hanle_mod,在函数中跳转到page_fault_handler中去
+   ```
+
+2. `page_fault_handler`函数 :
+
+   ```c
+   //lib/trap.c
+   void page_fault_handler(struct Trapframe *tf)
+   //tf参数时在调用放在$a0中,即当前的栈指针,当中保存着运行现场,为一个struct Trapframe结构体大小
+   {
+       u_int va;
+       u_int *tos, d;
+   	struct Trapframe PgTrapFrame;
+   	extern struct Env * curenv;
+   	bcopy(tf, &PgTrapFrame,sizeof(struct Trapframe));
+   	if(tf->regs[29] >= (curenv->env_xstacktop - BY2PG) && tf->regs[29] <= (curenv->env_xstacktop - 1))
+   	{
+   		tf->regs[29] = tf->regs[29] - sizeof(struct  Trapframe);
+   		bcopy(&PgTrapFrame, tf->regs[29], sizeof(struct Trapframe));
+   	}
+   	else
+   	{
+   		tf->regs[29] = curenv->env_xstacktop - sizeof(struct  Trapframe);
+   		bcopy(&PgTrapFrame, curenv->env_xstacktop - sizeof(struct  Trapframe), sizeof(struct Trapframe));
+   	}
+   	tf->cp0_epc = curenv->env_pgfault_handler;
+   	return;
+   }
+   ```
+
+   
+
+   
 
 
 
