@@ -190,7 +190,7 @@ void *set_except_vector(int n, void * addr){
 
 # 走进lab4 
 
-## 系统调用的基本流程
+## 基本系统调用
 
 ### 宏观上看一个系统调用的过程
 
@@ -692,7 +692,73 @@ void *set_except_vector(int n, void * addr){
        1. `e->env_tf.regs[2]`中保存的是**子进程保护现场中的返回值`v0`寄存器值,本来应该存储的是父进程的返回值(其实就是子进程的`env_id`)**
        2. **将其值人为的赋值为0即可实现在调用子进程恢复现场时使得返回值为0,即实现`fork`函数子进程返回0,父进程返回子进程`id`**
 
+## 缺页中断处理
+
+#### 处理流程
+
+总的流程与一般的异常处理流程相同
+
+1. **硬件工作** : `CPU`根据虚拟地址查页表时页表项无效,触发异常,记录缺页异常类型,跳转到异常分发代码
+2. **软件工作** : 
+   1. 异常分发代码判断为缺页异常,跳转(鬼知道怎么跳转的)到缺页异常处理代码
+   2. **在微内核的设计当中内核不做具体的处理,具体的缺页重填代码在用户态实现**
+   3. 用户态分配物理页,建立映射机制
+   4. 异常中断返回,重新访问该地址,程序继续运行
+
+#### 代码实现
+
+
+
+
+
 ## fork实现
+
+#### fork的功能
+
+#### 具体实现
+
+```c
+//user/fork.c
+int fork(void)
+{
+	u_int newenvid;
+	extern struct Env *envs;
+	extern struct Env *env;//将其指向当前的进程，如果子进程无法创建，则指向父进程
+	u_int i;
+	//设置缺页中断处理
+	set_pgfault_handler(pgfault);	
+	//alloc a new env
+	if((newenvid = syscall_env_alloc())==0){
+		//in child env
+		env = &envs[ENVX(syscall_getenvid())];
+		return 0;
+	}
+	/*use vpt vpd，我们只需要将父进程中相关的用户空间的页复制到子进程用户空间即可*/
+	/*注意创建一个进程的时候会调用env_vm_init函数，这个函数有个非常关键的操作,我们创建
+	子进程，复制父进程的地址空间只需要复制UTOP以下的页即可，因为所有进程UTOP以上的页都是利用
+	boot_pgdir作为模板复制的，不需要再次复制拷贝*/
+	/*we need judge whether the pgtable is exist or the page is exist.*/
+	for(i=0;i<UTOP-BY2PG;i+=BY2PG){
+		if(((*vpd)[VPN(i)/1024])!=0 && ((*vpt)[VPN(i)])!=0){
+			duppage(newenvid,VPN(i));
+		}
+	}
+	//搭建异常处理栈，分配一个页，让别的进程不抢占此页
+	if(syscall_mem_alloc(newenvid,UXSTACKTOP-BY2PG,PTE_V|PTE_R)<0){
+		user_panic("failed alloc UXSTACK.\n");
+		return 0;
+	}
+	//帮助子进程注册错误处理函数
+	if(syscall_set_pgfault_handler(newenvid,__asm_pgfault_handler,UXSTACKTOP)<0){
+		user_panic("page fault handler setup failed.\n");
+		return 0;
+	}
+	//we need to set the child env status to ENV_RUNNABLE,we must use syscall_set_env_status.
+	syscall_set_env_status(newenvid,ENV_RUNNABLE);
+	writef("OK! newenvid is:%d\n",newenvid);
+	return newenvid;
+}
+```
 
 
 
