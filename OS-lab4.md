@@ -282,6 +282,7 @@ void *set_except_vector(int n, void * addr){
       syscall	//触发系统调用异常
       jr	ra
       END(msyscall)
+      ```
    ```
    
    * **当调用`syscall`时发生了什么 : **
@@ -294,6 +295,7 @@ void *set_except_vector(int n, void * addr){
         2. 参数的传递按照`o32ABI`的约定进行 :
         * 在`syscall_lib.c`中C函数调用`msyscall(SYS_*, arg1,...arg5)`时**依据约定栈区划定24字节空间,前4个参数通过`$a0-$a3`传递,后两个参数通过栈区传递**
            * ~~我为什么不能把所有的参数都放进栈中,为什么,艹~~
+   ```
 
 2. 内核态的行为
 
@@ -400,7 +402,301 @@ void *set_except_vector(int n, void * addr){
 
 #### 各种系统调用
 
-1. 
+1. `void sys_yield(void)` : 
+
+   * 函数作用 : 在用户态下做到进程切换
+
+   * 具体实现 : 
+
+     ```c
+     void sys_yield(void)
+     {
+         // 先保存现场
+     	struct Trapframe * src = (struct Trapframe *)(KERNEL_SP - sizeof(struct Trapframe));
+     	struct Trapframe * dst = (struct Trapframe *)(TIMESTACK - sizeof(struct Trapframe));
+     	bcopy((void *)src,(void *)dst,sizeof(struct Trapframe));
+     	sched_yield();//执行时间片轮转调度
+     }
+     ```
+
+     有两个问题 : 
+
+     * **为什么在此处我们保存现场时将`KERNEL_SP`栈中的数据保存到`TIMESTACK`栈中去,而在`lab3`中的进程切换的保存恢复现场都是在`TIMESTACK`中进行的 ? **
+
+       ~~很不幸,这个问题沙雕的我不想思考~~
+
+       我认为**`kERNEL_SP`是系统调用异常时保存现场的区域,而`TIMESTACK`是时钟中断异常时保存现场的区域**
+
+       **其实这个关键在于`SAVE_ALL`中的`get_sp`** : 
+
+       ```c
+       //include/stackframe.h
+       .macro SAVE_ALL    
+                                         
+       		mfc0	k0,CP0_STATUS                   
+       		sll		k0,3   
+       		bltz	k0,1f                            
+       		nop      		           
+       1:				
+       		move	k0,sp 
+       		get_sp      //获取要保存寄存器的栈的栈指针
+       		move	k1,sp                     
+       		subu	sp,k1,TF_SIZE  // 栈指针下移获得空间                 
+       		sw	k0,TF_REG29(sp)    // 保存寄存器
+       		........
+       .macro get_sp
+       	mfc0	k1, CP0_CAUSE
+       	andi	k1, 0x107C	//获取CAUSE寄存器中的ExcCode段
+       	xori	k1, 0x1000
+       	bnez	k1, 1f
+       	nop
+       	li	sp, 0x82000000	//取TIMESTACK为保存的栈
+       	j	2f
+       	nop
+       1:
+       	bltz	sp, 2f
+       	nop
+       	lw	sp, KERNEL_SP  //取KERNEL_SP为保存的栈
+       	nop
+       2:	nop
+       .endm
+       ```
+
+       即 : 
+
+       * **在系统调用时异常处理程序第一步是将寄存器信息保存到`KERNEL_SP`栈区**
+       * **在时钟中断时异常处理程序第一步是将寄存器信息保存到`TIMESTACK`栈区**
+
+       所以该函数的实现如下 : 
+
+       1. 进入该函数时寄存器信息已经保存到`KERNEL_SP`栈区了(`handle_sys`中)
+
+       2. **但是在`env_run`中我们默认是时钟中断导致的进程切换,没有考虑用户显式的命令进程切换,所以我们在切换之前保存当前进程信息都是从`TIMESTACK`中取数据,所以一定要将`KERNEL_SP`中的现场在`TIMESTACK`中备份一份以便进程切换**
+
+          ```c
+          //lib/env.c/evn_run()
+          struct Trapframe *old = (struct Trapframe *)(TIMESTACK-sizeof(struct Trapframe));
+          	if(curenv){
+          		bcopy(old,&(curenv->env_tf),sizeof(struct Trapframe));
+          		//curenv->env_tf.pc += 4;//aim to mips 32
+          		curenv->env_tf.pc = old->cp0_epc;
+          		//printf("cp0_epc:%x\n",curenv->env_tf.pc);
+          	}
+          ```
+
+     * **调度函数的逻辑需要修改**
+
+       在`lab4`的进程切换函数中我们有了新的需求,我认为大概要求如下 : 
+
+       1. 待调度链表中可以有状态为`ENV_NOTRUNNABLE`的进程控制块,要求其不能被调度
+       2. **用户态可以使用系统调用设置一个进程为`ENV_NOTRUNNABLE`状态,要求进入调度算法时当前进程若为`ENV_NOTRUNNABLE`,即使其时间片还未用完也调度走**
+
+       在`lab3`的基础上增加几个判断即可,基本思想还是**用两个链表模拟循环链表**
+
+       ```c
+       //lib/sched.c
+       void sched_yield(void) {
+       	static int counter = 0;
+       	static int t = 0;
+       	counter++;
+       	if (curenv == NULL || counter >= curenv->env_pri || curenv->env_status != ENV_RUNNABLE)	//进程未NOTRUNNABLE立即调度
+       	{
+       		if (curenv != NULL)
+       		{
+       			LIST_INSERT_TAIL(&env_sched_liat[t^1], curenv, env_sched_link);
+       		}
+       		while(1) {
+       			struct  Env *e = LIST_FIRST(&env_sched_list[t]);
+       			if (e == NULL)
+       			{
+       				t = t ^ 1;
+       				continue;
+       			}
+       			if (e->env_status == ENV_RUNNABLE)
+       			{
+       				LIST_REMOVE(e, env_sched_link);
+       				counter = 0;
+       				env_run(e);
+       				break;
+       			}
+       			else {	//NOT_RUNNABKLE的扔到另一个链表中
+       				LIST_REMOVE(e, env_sched_link);
+       				LIST_INSERT_TAIL(&env_sched_list[t^1], e, env_sched_link);
+       			}
+       		}
+       	}
+       	env_run(curenv);
+       }
+       ```
+
+2. `int sys_mem_alloc(iint sysno, u_int envid, u_int va, u_int perm)` : 
+
+   * 函数作用 : 给指定进程`envid`的指定地址`va`分配一页地址
+
+   * 具体实现 :
+
+     ```c
+     int sys_mem_alloc(int sysno, u_int envid, u_int va, u_int perm)
+     {
+     	//检查虚拟地址va是否合法
+     	if(va>=UTOP || va<0){
+     		printf("Sorry,use sys_mem_alloc must promise va < UTOP(%x),but now va:%x\n",UTOP,va);
+     		return -E_UNSPECIFIED;
+     	}
+     	//检查权限位
+     	if((perm & PTE_COW) || !(perm & PTE_V)){
+     		printf("Sorry,use sys_mem_alloc must promise perm not contain PTE_COW.\n");
+     		return -E_INVAL;
+     	}
+     	struct Env *env;
+     	struct Page *ppage;
+         if(envid2env(envid,&env,0)<0){
+     		printf("Sorry,you can't get the env by the given env_id.\n");
+     		return -E_BAD_ENV;
+     	}
+         //新分配一个物理页
+     	if(page_alloc(&ppage)<0){
+     		printf("Sorry,use sys_mem_alloc can't get a free page memory.\n");
+     		return -E_NO_MEM;
+     	}
+     	ppage->pp_ref++;
+         //在进程的页表中建立映射关系
+     	if(page_insert(env->env_pgdir,ppage,va,perm)<0){
+     		printf("Sorry,in sys_mem_alloc we can't insert the alloced page to env_pgdir.\n");
+     		return -E_NO_MEM;
+     	}
+     	return 0;
+     }
+     ```
+
+     注 : 关于`envid2env中的checkperm参数` : 
+
+     1. 当为0时不影响
+     2. 当为1是要求查询的进程**为当前进程或者当前进程的直接子进程**
+
+3. `int sys_mem_map(int sysno, u_int srcid, u_int srcva, u_int dstid, u_int dstva, u_int perm)` : 
+
+   * 函数作用 : 在目标进程`dstid`的页表结构中以`perm`的权限建设从虚拟页`dstva`到源进程`srcid`中`srcva`对应的物理页的页表映射结构
+
+   * 具体实现 :
+
+     ```c
+     int sys_mem_map(int sysno, u_int srcid, u_int srcva, u_int dstid, u_int dstva, u_int perm)
+     {
+     	int ret;
+     	u_int round_srcva, round_dstva;
+     	struct Env *srcenv;
+     	struct Env *dstenv;
+     	struct Page *ppage;
+     	Pte *ppte;
+     	ppage = NULL;
+     	ret = 0;
+     	round_srcva = ROUNDDOWN(srcva, BY2PG);
+     	round_dstva = ROUNDDOWN(dstva, BY2PG);
+         //检查地址是否合法
+     	if(srcva>=UTOP || dstva>=UTOP || srcva<0 || dstva<0){
+     		printf("Sorry,srcva:%x and dstva:%x must <UTOP(%x).\n",srcva,dstva,UTOP);
+     		return -E_UNSPECIFIED;
+     	}
+     	//检查权限位是否合法
+     	if(!(perm & PTE_V)){
+     		printf("Sorry,in sys_mem_map perm is illegal.\n");
+     		return -E_INVAL;
+     	}
+     	//获得进程控制结构
+     	if(envid2env(srcid,&srcenv,0)<0){
+     		printf("Sorry,we can't get srcenv!\n");
+     		return -E_BAD_ENV;
+     	}
+     	if(envid2env(dstid,&dstenv,0)<0){
+     		printf("Sorry,we can't get dstenv!\n");
+     		return -E_BAD_ENV;
+     	}
+     	//从srcenv中获取要映射的物理页
+     	if((ppage=page_lookup(srcenv->env_pgdir,round_srcva,&ppte))==0){
+     		printf("Sorry,we found srcenv not exist page at %x.\n",round_srcva);
+     		return -E_UNSPECIFIED;
+     	}
+     	//在dstenv中建立页表映射关系
+     	if(page_insert(dstenv->env_pgdir,ppage,round_dstva,perm)<0){
+     		printf("Sorry,in sys_mem_map can't insert src page to dst page.\n");
+     		return -E_NO_MEM;
+     	}
+     	return ret;
+     }
+     ```
+
+4. `int sys_mem_unmap(int sysno, u_int envid, u_int va)` : 
+
+   * 函数作用 : 在进程`envid`的页表结构中去掉`va`虚拟页的映射结构
+
+   * 具体实现 :
+
+     ```c
+     int sys_mem_unmap(int sysno, u_int envid, u_int va)
+     {
+     	int ret = 0;
+     	struct Env *env;
+     	if(va>=UTOP){
+     		printf("Sorry,in sys_mem_unmap va:%x >=UTOP %x.\n",va,UTOP);
+     		return -E_INVAL;
+     	}
+     	if(envid2env(envid,&env,PTE_V)<0){
+     		printf("Sorry,in sys_mem_unmap we can't get env.\n");
+     		return -E_INVAL;
+     	}
+     	page_remove(env->env_pgdir,va);
+     	return ret;
+     }
+     
+     ```
+
+5. `int sys_env_alloc(void)` : 这个函数与一般概念上的建立进程不同
+
+   * 函数作用 : **以当前进程作为父进程, 以父进程为模板创建一个高度相似的子进程**
+
+   * 具体实现 :
+
+     ```c
+     int sys_env_alloc(void)
+     {
+     	struct Env *e;
+         //分配进程控制块
+     	if(env_alloc(&e,curenv->env_id)<0){
+     		printf("Sorry,because unable allocate a env,fork failed.\n");
+     		return -E_NO_FREE_ENV;
+     	}
+     	e->env_status = ENV_NOT_RUNNABLE;
+         //插入调度链表
+         LIST_INSERT(&env_sched_list[0], e, env_sched_link);
+         //将父进程的环境拷贝一份给子进程
+     	bcopy(KERNEL_SP-sizeof(struct Trapframe),&(e->env_tf),sizeof(struct Trapframe));
+         //之后这两条语句很重要,详见下文
+     	e->env_tf.pc = e->env_tf.cp0_epc;
+     	e->env_tf.regs[2] = 0;
+     	return e->env_id;
+     }
+     ```
+
+     **注 : 这个函数其实东西比较多 : **
+
+     * `e->env_tf.pc = e->env_tf.cp0_epc`
+
+       **即子进程下一次被调度运行是从父进程创建子进程的系统调用后一条语句开始的**
+
+       1. `e->env_tf.cp0_epc`是由**父进程拷贝过来**,所以该数据保存的是**父进程调用该系统调用创建子进程时的中断语句**
+       2. `e->env_tf.pc`是**子进程下一次开始运行的语句**
+
+     * **`e->env_tf.regs[2] = 0`** : **这句话很重要,它是`fork`机制父子进程返回值不同的基础**
+
+       1. `e->env_tf.regs[2]`中保存的是**子进程保护现场中的返回值`v0`寄存器值,本来应该存储的是父进程的返回值(其实就是子进程的`env_id`)**
+       2. **将其值人为的赋值为0即可实现在调用子进程恢复现场时使得返回值为0,即实现`fork`函数子进程返回0,父进程返回子进程`id`**
+
+## fork实现
+
+
+
+
 
 
 
