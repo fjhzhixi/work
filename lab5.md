@@ -279,6 +279,8 @@ void ide_write(u_int diskno, u_int secno, void *src, u_int nsecs)
 
 **图示** :
 
+![](OS-lab5\gen_file.png)
+
 #### 数据结构
 
 ```c
@@ -409,7 +411,9 @@ struct Block {
 
 ##### 实现流程
 
-1. main`函数 : 运行生成磁盘镜像文件
+![](OS-lab5\main_call.png)
+
+1. `main`函数 : 运行生成磁盘镜像文件
 
    ```c
    int main(int argc, char **argv) {
@@ -434,7 +438,7 @@ struct Block {
                write_file(&super.s_root, argv[i]);//逐个读取源文件以磁盘文件的形式组织起来
            }
        }
-       flush_bitmap();//初始化位图控制块
+       flush_bitmap();//改变位图控制块
        finish_fs(argv[1]);//生成目标文件
        return 0;
    }
@@ -459,7 +463,7 @@ struct Block {
        for(i = 0; i < nbitblock; ++i) {
            disk[2+i].type = BLOCK_BMAP;
        }
-      //??最开始的使用的块为什么不标记为使用的??
+      //标记可用的位(前3个块在最后标记为不可用)
        for(i = 0; i < nbitblock; ++i) {
            memset(disk[2+i].data, 0xff, NBLOCK/8);
        }
@@ -531,6 +535,92 @@ struct Block {
            write(fd, disk[i].data, BY2BLK);//将数据块内容写入文件
        }
        close(fd);
+   }
+   ```
+
+
+#### 结果
+
+最后的文件结构为 :
+
+![](OS-lab5\file_struct.png)
+
+### 块缓存机制
+
+**我们使用磁盘中的数据是通过将其加载到内存中的位置实现的**
+
+1. 映射机制
+
+   将`DISKMA1P`到`DISKMAP+DISKMAX`这一段虚存地址空间 `(0x10000000-0xcﬀﬀﬀ)`作为缓冲区,当磁盘读入内存时,分配相应的物理页来保存数据,映射关系直接是**地址从低到高,数据块索引从小到大的线性映射**
+
+   **注意 : 在我们的体系中磁盘上的一个数据块大小与内存中的一页相同,都是`4KB`**
+
+2. 功能函数 : 
+
+   ```c
+   //根据数据块索引得到在内存中映射的虚拟地址
+   u_int diskaddr(u_int blockno)
+   {
+           if ( super && blockno > (super->s_nblocks)) {
+                   user_panic("diskaddr failed!");
+           }
+           return DISKMAP+blockno*BY2BLK;
+   }
+   /*判断该虚拟页是否有物理页与之对应
+    *有返回1,没有返回0
+    *通过判断页目录与页表的对应项是否有效
+   */
+   u_int va_is_mapped(u_int va)
+   {
+           return (((*vpd)[PDX(va)] & (PTE_V)) && ((*vpt)[VPN(va)] & (PTE_V)));
+   }
+   /*判断该索引的数据块是否在内存中有有效的虚拟页对应
+    *如果有返回va值,没有返回0
+    *通过判断其映射的虚拟地址是否与物理页与之对应
+   */
+   u_int block_is_mapped(u_int blockno)
+   {
+           u_int va = diskaddr(blockno);
+           if (va_is_mapped(va)) {
+                   return va;
+           }
+           return 0;
+   }
+   
+   u_int va_is_dirty(u_int va)
+   {
+           return (* vpt)[VPN(va)];
+   }
+   
+   u_int block_is_dirty(u_int blockno)
+   {
+           u_int va = diskaddr(blockno);
+           return va_is_mapped(va) && va_is_dirty(va);
+   }
+   /*对该索引的数据块在虚拟内存中建立缓存页
+    *如果
+   */
+   int map_block(u_int blockno)
+   {
+           u_int va;
+           if (va = block_is_mapped(blockno)) {
+                   return 0;
+           }
+           return syscall_mem_alloc(0,va,PTE_V|PTE_R);
+   }
+   
+   void unmap_block(u_int blockno)
+   {
+           int r;
+           u_int va;
+           if (va=block_is_mapped(blockno)) {
+                   if (!block_is_free(blockno) && block_is_dirty(blockno)) {
+                           write_block(blockno);
+                   }
+                   if (syscall_mem_unmap(0,va))
+                           writef("unmap_block failed!");
+           }
+           user_assert(!block_is_mapped(blockno));
    }
    ```
 
