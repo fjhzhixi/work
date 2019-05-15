@@ -124,9 +124,9 @@ void ide_read(u_int diskno, u_int secno, void *dst, u_int nsecs)
          syscall_write_dev(&diskno, 0x13000010, 4);//写入磁盘号,理论上恒为0(因为只有一个磁盘)
          int va = offset_begin + offset;
          syscall_write_dev(&va, 0x13000000, 4);//写入偏移量决定操作的磁盘空间位置
-         va = 0;
-         syscall_write_dev(&va, 0x13000020, 4);//写入操作数为0表示读
-         syscall_read_dev(&va, 0x13000030, 1);//读取状态值
+         char operate = 0;
+         syscall_write_dev(&operate, 0x13000020, 1);//写入操作数为0表示读
+         syscall_read_dev(&va, 0x13000030, 4);//读取状态值
 		if (va != 0)//读操作成功,此时数据已经存到了磁盘外设寄存器中
 		{//对于读操作先启动磁盘将数据从由offset决定的扇区读出写入磁盘buffer再从buffer中读出到目标用户地址dst中
 			syscall_read_dev(dst + offset, 0x13004000, 0x200);
@@ -150,9 +150,9 @@ void ide_write(u_int diskno, u_int secno, void *src, u_int nsecs)
          syscall_write_dev(&va, 0x13000000, 4);//写入偏移量决定操作的磁盘空间位置
          //对于写操作先将要写入的数据写到磁盘外设寄存器中的buffer中,在向磁盘写入操作位磁盘自身从buffer中读取数据写入由offset决定的扇区中
          syscall_write_dev(src + offset, 0x13004000, 0x200);
-         va = 1;
-         syscall_write_dev(&va, 0x13000020, 4);//写入操作数为1表示写
-         syscall_read_dev(&va, 0x13000030, 1);//读取状态值
+         char operate = 1;
+         syscall_write_dev(&operate, 0x13000020, 1);//写入操作数为1表示写
+         syscall_read_dev(&va, 0x13000030, 4);//读取状态值
 		if (va != 0) {//写操作成功
 			offset += 0x200;		
 		} else {
@@ -170,7 +170,7 @@ void ide_write(u_int diskno, u_int secno, void *src, u_int nsecs)
 
 ![](OS-lab5\dis_mm.png)
 
-### 磁盘在物理和逻辑层次上的表现
+### 磁盘在物理和逻辑层次上的表示
 
 我们将磁盘的空间抽象成了文件的形式,在物理层次和逻辑层次磁盘空间有不同的划分 :
 
@@ -237,7 +237,7 @@ void ide_write(u_int diskno, u_int secno, void *src, u_int nsecs)
    #define NDIRECT		10
    struct File {
    	u_char f_name[MAXNAMELEN];	//文件名
-   	u_int f_size;			   //文件的字节大小
+   	u_int f_size;			   //文件包含的数据块的字节大小
    	u_int f_type;			   //文件的类型
    	u_int f_direct[NDIRECT];    //10个直接的数据指针,指向磁盘中组成文件的数据块
    	u_int f_indirect;		   //当文件内容过大时使用间接数据指针
@@ -248,10 +248,290 @@ void ide_write(u_int diskno, u_int secno, void *src, u_int nsecs)
 
    * 直接指针 : 一共有10个,每个指向一个`4KB`的数据块,所以**只通过直接数据指针最大表示`40KB`大小的文件**
 
-   * 间接指针 : 当文件大小超过`40KB`时使用 : **其为一个指向(存储(指向(存储文件内容的磁盘块)的指针)的数据块)的指针)**
+   * 间接指针 : 当文件大小超过`40KB`时使用 : **其为一个指向(存储(指向(存储文件内容的磁盘块)的指针)的数据块)的指针)**,间接指针指向的还是有个块,但是其**特殊之处在于该块中存储的不是文件的数据内容,而是指向存储文件数据内容的块的指针们**
 
      为方便起见在该**特殊的数据块中我们前10个指针缺省,这些由直接指针实现功能**
 
    ![](OS-lab5\data_point.png)
+
+**注意** :
+
+1. 在我们的体系中, **目录也是文件,是一种特殊的文件而已,特殊之处在于 : **
+   * **一般文件的控制块指针指向的数据块存储的是文件自身的数据**
+   * **目录文件的控制块指针指向的数据块存储的是其目录下包含的文件(或者文件目录)的控制块**
+2. 我们是用**数组的形式将数据块组织起来的**,所以在文件控制块中我们所谓的指向**数据块的指针其实就是保存该数据块的数组下标即可**(之后统一用指针表达比较形象)
+
+### 如何构建一个文件
+
+该功能的实现是在`fsformat.c`中实现,其作用是**基于数个已经存在的源文件将其组织成磁盘上的文件的形式,最后生成`fs.img`磁盘文件**
+
+#### 基本流程
+
+1. 初始化磁盘结构 : 
+   * 第一个磁盘块为`boot`启动块
+   * 第二个磁盘块为记录数据块使用情况的位图`map`块
+   * 第三个磁盘块为保存`super`块
+2. 对每个源文件 : 
+   * 填写文件控制块
+   * 拷贝数据块并建立链接指针
+3. 初始位图,标记已经使用的数据块
+4. 将构造好的磁盘结构生成文件`fs.img`文件
+
+**图示** :
+
+#### 数据结构
+
+```c
+typedef struct Super Super; //超级块结构
+typedef struct File File;   //文件控制块结构
+
+#define BY2BLK		BY2PG//4096,即一个块的字节(Byte)数,一个块4KB大小
+#define BIT2BLK		(BY2BLK*8)//一个块中的位数(Bit)
+#define NBLOCK 1024 // 一个磁盘中的数据块的数目
+uint32_t nbitblock; // bitmap位图结构占据的数据块个数
+uint32_t nextbno;   // 始终指向当前第一个可用的数据块结构
+
+struct Super super;//超级块结构
+
+enum {//块存储的都是数据,但是数据的含义不同
+    BLOCK_FREE  = 0,//空闲块
+    BLOCK_BOOT  = 1,//根目录块
+    BLOCK_BMAP  = 2,//位图结构块
+    BLOCK_SUPER = 3,//超级块
+    BLOCK_DATA  = 4,//存储文件数据块
+    BLOCK_FILE  = 5,//存储文件控制块的块
+    BLOCK_INDEX = 6,//存储文件控制块中的间接数据指针的块
+};//表示数据块的类型
+//与所有数据块对应的数据结构
+struct Block {
+    uint8_t data[BY2BLK];//字节数组
+    uint32_t type;
+} disk[NBLOCK];//该数组结构代表一个磁盘中所有可用的数据块
+```
+
+**注意 : 一个`block`中存储的数据有多种含义**
+
+#### 具体实现
+
+函数调用图示 :
+
+##### 功能函数 
+
+1. `next_block(int type)` : 获得**当前可用的第一个数据块下标返回,并设定该块的使用类型**
+
+   ```c
+   int next_block(int type) {
+       disk[nextbno].type = type;
+       return nextbno++;//先return再+++
+   }
+   ```
+
+2. `save_block_link(struct File *f, int nblk, int bno)` : **将第`bno`个数据块链接到`f`文件的第`nblk`个指针**
+
+   ```c
+   void save_block_link(struct File *f, int nblk, int bno)
+   {
+       assert(nblk < NINDIRECT);
+       if(nblk < NDIRECT) {//当可以用直接指针表示时
+           f->f_direct[nblk] = bno;//建立映射
+       }
+       else {
+           if(f->f_indirect == 0) {//当第一次用间接指针表示时
+               f->f_indirect = next_block(BLOCK_INDEX);//为间接指针分配一个数据块用来存储指向数据块的指针,实际上就是给f_indirect赋值一个空闲块的下标
+           }
+           /*通过disk[f->f_indirect].data获得存储指针的数据块的数据数组
+            *注意此处的强制类型转换不可以少,因为data[]自身是字节数组,但是一个bno占一个字大小
+            *所以要(uint32_t *)之后再通过[nblk]索引
+           */
+           ((uint32_t *)(disk[f->f_indirect].data))[nblk] = bno;
+       }
+   }
+   ```
+
+   说明 : 
+
+   * `#define NINDIRECT  (BY2BLK/4)` : `NINDIRECT`值为1024,即一个文件**最多外接1024个数据块**,这是因为一个文件控制块只有一个间接指针,指向一个`4KB`大小的存储指针的块,而一个指针`4B`大小,所以最多存储1024个指向数据块的指针
+   * `#define NDIRECT 10` : 表示一个文件控制块有10个直接指针
+
+3. `make_link_block(struct File *dirf, int nblk)` : **该函数是对目录文件的操作(第一个参数)**
+
+   为该目录文件控制块的`nblk`指针**分配一块存储目录下属文件的控制块的块**,增加目录文件的大小并返回分配的块的下标
+
+   ```c
+   int make_link_block(struct File *dirf, int nblk) {
+       save_block_link(dirf, nblk, nextbno);
+       dirf->f_size += BY2BLK;
+       return next_block(BLOCK_FILE);
+   }
+   ```
+
+4. `create_file(struct File *dirf)` : **该函数是对目录文件的操作(第一个参数)**
+
+   **在目录文件`dirf`中找到一个可以写入(所属文件的控制块)的空闲数据块地址,返回该地址[当不存在空闲数据区域时新分配数据块用来保存文件控制块]**
+
+   ```c
+   struct File *create_file(struct File *dirf) {
+       struct File *dirblk;
+       int i, bno, found;
+       int nblk = dirf->f_size / BY2BLK;//获得当前目录文件有效的数据指针个数
+       if(nblk == 0) {//该目录文件没有数据块,使用make_link_block分配,此时nblk = 0
+           return (struct File *)(disk[make_link_block(dirf, 0)].data);
+       }
+       if(nblk <= NDIRECT) {//还在使用直接数据块指针阶段
+           bno = dirf->f_direct[nblk-1];
+       }
+       else {//使用间接数据块指针
+           bno = ((uint32_t *)(disk[dirf->f_indirect].data))[nblk-1];
+       }
+       //至此获得当前文件最后一个数据块的下标,
+       /*之后按文件控制块的大小遍历该数据块
+        *检查文件名是否为空来确定是否是空闲文件控制块
+        *返回找到的第一个空闲文件控制块的指针
+       */
+       dirblk = (struct File *)(disk[bno].data);
+       for(i = 0; i < FILE2BLK; ++i) {
+           if(dirblk[i].f_name[0] == '\0') {
+               // found spare file link.
+               return &dirblk[i];
+           }
+       }
+       /*当最后一个数据块没有空闲文件控制块时
+        *给目录文件使用make_link_block新分配一个
+        *返回新数据块的首地址(以文件控制块指针的形式)
+       */
+       return (struct File *)(disk[make_link_block(dirf, nblk)].data);
+   }
+   ```
+
+   **注意 : 有如下的关系** :
+
+   * **`f_size = nblk * BY2BLK` : `nblk`为该(目录)文件有效的数据块指针的个数**
+
+##### 实现流程
+
+1. main`函数 : 运行生成磁盘镜像文件
+
+   ```c
+   int main(int argc, char **argv) {
+       /*参数的含义
+        *第一个参数为文件名本身argv[0]
+        *第二个参数是产生的磁盘镜像的目标文件路径argv[1]
+        *之后的参数是基于的源文件argv[2]...
+       */
+       int i;
+       init_disk();	//初始化
+       if(argc < 3 || strcmp(argv[2], "-r") == 0 && argc != 4) {//参数错误
+           fprintf(stderr, "\Usage: fsformat gxemul/fs.img files...\n\fsformat gxemul/fs.img -r DIR\n");
+           exit(0);
+       }
+       if(strcmp(argv[2], "-r") == 0) {
+           for (i = 3; i < argc; ++i) {
+               write_directory(&super.s_root, argv[i]);//不要求实现
+           }
+       }
+       else {
+           for(i = 2; i < argc; ++i) {
+               write_file(&super.s_root, argv[i]);//逐个读取源文件以磁盘文件的形式组织起来
+           }
+       }
+       flush_bitmap();//初始化位图控制块
+       finish_fs(argv[1]);//生成目标文件
+       return 0;
+   }
+   ```
+
+2. `init_disk()` : 初始化磁盘结构
+
+   * 第一个块初始化为`boot`
+   * 第二个块初始化为`super`
+   * 之后若干个需要大小的块初始化为`bitmap`
+
+   ```c
+   void init_disk() {
+       int i, r, diff;
+       //第一个块为boot结构
+       disk[0].type = BLOCK_BOOT;
+       //建立bitmap结构
+       //NBLOCK为块的数目,所以应该分配NBLOCK个bit大小来存储bitmap结构
+       //(+ BIT2BLK - 1)的操作是因为当填不满某一块时也要分配给bitmap(剩余一部分)
+       nbitblock = (NBLOCK + BIT2BLK - 1) / BIT2BLK;
+       nextbno = 2 + nbitblock;
+       for(i = 0; i < nbitblock; ++i) {
+           disk[2+i].type = BLOCK_BMAP;
+       }
+      //??最开始的使用的块为什么不标记为使用的??
+       for(i = 0; i < nbitblock; ++i) {
+           memset(disk[2+i].data, 0xff, NBLOCK/8);
+       }
+       //当多余的无效的位都标记为0表示不可用
+       if(NBLOCK != nbitblock * BY2BLK) {
+           diff = NBLOCK % BY2BLK / 8;
+           memset(disk[2+(nbitblock-1)].data+diff, 0x00, BY2BLK - diff);
+       }
+       //初始化super块中的数据
+       disk[1].type = BLOCK_SUPER;
+       super.s_magic = FS_MAGIC;
+       super.s_nblocks = NBLOCK;
+       super.s_root.f_type = FTYPE_DIR;
+       strcpy(super.s_root.f_name, "/");
+   }
+   ```
+
+3. `write_file(struct File *dirf, const char *path)` : **将`path`指定的文件写入`dirf`文件目录之下**
+
+   1. 为文件新建一个控制块并加入到`dirf`目录文件中(`create_file`实现)
+   2. 填写新建的文件控制块的各个数据域
+   3. 将文件中的内容拷贝到数据块中并**建立到新建文件控制块的链接** (`save_block_link`实现)
+
+   ```c
+   void write_file(struct File *dirf, const char *path) {
+       int iblk = 0, r = 0, n = sizeof(disk[0].data);
+       uint8_t buffer[n+1], *dist;
+       struct File *target = create_file(dirf);//将target文件控制块加入dirf目录文件中
+       int fd = open(path, O_RDONLY);//该处的open是在fcntl.h标准头文件中包含的C标准函数
+       const char *fname = strrchr(path, '/');//获得最后一个/的位置
+       if(fname)
+           fname++;//找到了之后该位置之后的字符串就是文件名
+       else
+           fname = path;//没找到则该path就是顶层,本身就是文件名
+       strcpy(target->f_name, fname);//向文件控制块写入文件名
+       target->f_size = lseek(fd, 0, SEEK_END);//将文件指针移动到文件末尾,获得文件的大小
+       target->f_type = FTYPE_REG;//该文件类型为常规类型
+       //开始遍历path得到的文件将其中的内容写入文件控制块指向的数据块中
+       lseek(fd, 0, SEEK_SET);//将参数移动到文件的头部(偏移为0)
+       while((r = read(fd, disk[nextbno].data, n)) > 0) {//将fd文件中读出的数据写入到disk[nextbno].data中,一次写入一个data块大小(n字节)
+           save_block_link(target, iblk++, next_block(BLOCK_DATA));//建立数据块到所属文件控制块的映射
+       }
+       close(fd);
+   }
+   ```
+
+4. `flush_bitmap` : 将使用过的数据块在位图管理结构`bitmap`中标记为已使用的
+
+   ```c
+   void flush_bitmap() {
+       int i;
+       //nextbo为使用过的数据块个数
+       for(i = 0; i < nextbno; ++i) {
+           ((uint32_t *)disk[2+i/BIT2BLK].data)[(i%BIT2BLK)/32] &= ~(1<<(i%32));
+       }
+   }
+   ```
+
+5. `finish_fs(char *name)` : **根据之前组织好的内存中的数据生成磁盘镜像文件**
+
+   ```c
+   void finish_fs(char *name) {
+       int fd, i, k, n, r;
+       uint32_t *p;
+       memcpy(disk[1].data, &super, sizeof(super));//将super放入磁盘第一个数据块
+       fd = open(name, O_RDWR|O_CREAT, 0666);
+       for(i = 0; i < 1024; ++i) {
+           reverse_block(disk+i);
+           write(fd, disk[i].data, BY2BLK);//将数据块内容写入文件
+       }
+       close(fd);
+   }
+   ```
 
    
