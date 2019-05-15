@@ -202,6 +202,8 @@ void ide_write(u_int diskno, u_int secno, void *src, u_int nsecs)
 
 ### 位图结构
 
+在该实验中我们使用`u_int *bitmap`(在`fs.c`中定义)来实现位图结构
+
 **位图结构用来标记某一数据块是否被使用过,一位代表一个数据块, 为1表示空闲,为0表示不可被使用**
 
 1. 初始化 : 
