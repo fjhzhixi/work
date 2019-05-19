@@ -193,6 +193,7 @@ void ide_write(u_int diskno, u_int secno, void *src, u_int nsecs)
 1. 超级块结构
 
    ```c
+   //include/fs.h
    struct Super {
    	u_int s_magic;		//魔数用来校验是否合法
    	u_int s_nblocks;	//保存该磁盘中的数据块个数
@@ -284,6 +285,7 @@ void ide_write(u_int diskno, u_int secno, void *src, u_int nsecs)
 #### 数据结构
 
 ```c
+//fs/fsformat.c
 typedef struct Super Super; //超级块结构
 typedef struct File File;   //文件控制块结构
 
@@ -558,6 +560,7 @@ struct Block {
 2. 功能函数 : 
 
    ```c
+   //fs/fs.c
    //根据数据块索引得到在内存中映射的虚拟地址
    u_int diskaddr(u_int blockno)
    {
@@ -586,19 +589,87 @@ struct Block {
            }
            return 0;
    }
-   
+   /*检查该虚拟地址对应的数据是否改变过
+    *改变过返回1,否则返回0
+    *通过检查对应页表项的dirty位来实现
+   */
    u_int va_is_dirty(u_int va)
    {
-           return (* vpt)[VPN(va)];
+           return (* vpt)[VPN(va)] & PTE_D;
    }
-   
+   /*判断当前块是否有效
+    *有效则返回1,无效则返回0
+    *根据位图结构中对应位的值
+   */
+   int
+   block_is_free(u_int blockno)
+   {
+           if (super == 0 || blockno >= super->s_nblocks) {//块号超过范围
+                   return 0;
+           }
+           if (bitmap[blockno / 32] & (1 << (blockno % 32))) {
+                   return 1;
+           }
+           return 0;
+   }   
+   /*检查该块是否修改过
+    *修改过返回1,否则返回0
+    *通过检查块映射虚拟地址的dirty位
+   */
    u_int block_is_dirty(u_int blockno)
    {
            u_int va = diskaddr(blockno);
            return va_is_mapped(va) && va_is_dirty(va);
    }
-   /*对该索引的数据块在虚拟内存中建立缓存页
-    *如果
+   //从磁盘中读取blockno代表的数据块到其规定的虚拟地址缓存中,并将blk的值设置为该虚拟地址的值,若是第一次加载则设置isnew为1
+   int read_block(u_int blockno, void **blk, u_int *isnew)
+   {
+           u_int va;
+           if (super && blockno >= super->s_nblocks) {
+                   user_panic("reading non-existent block %08x\n", blockno);
+           }
+       	//检查该块是否在位图结构中对应的位有效
+           if (bitmap && block_is_free(blockno)) {
+                   user_panic("reading free block %08x\n", blockno);
+           }
+           va = diskaddr(blockno);
+   		/*检查该块是否在虚拟内存中有有效的映射缓冲块
+   		 *如果已有映射说明磁盘中的数据已经读到了缓冲块中,只需设置isnew标记位为0即可
+   		 *如果没有映射则新分配一个物理页用来作为该块在虚拟内存中的缓冲块,并从磁盘中读取数据填入,并且设置isnew标记位1
+   		 *设置blk为作为缓存块的虚拟地址
+   		*/
+           if (block_is_mapped(blockno)) { //the block is in memory
+                   if (isnew) {
+                           *isnew = 0;
+                   }
+           } else {                        //the block is not in memory
+                   if (isnew) {
+                           *isnew = 1;
+                   }
+                   syscall_mem_alloc(0, va, PTE_V | PTE_R);
+                   ide_read(0, blockno * SECT2BLK, (void *)va, SECT2BLK);
+           }
+           if (blk) {
+                   *blk = (void *)va;
+           }
+           return 0;
+   }
+   //将第blockno块在内存中的虚拟缓存中的数据写回磁盘中
+   void write_block(u_int blockno)
+   {
+           u_int va;
+           //检测当前块是否存储有效的虚拟内存缓存块
+           if (!block_is_mapped(blockno)) {
+                   user_panic("write unmapped block %08x", blockno);
+           }
+   		//向磁盘中写入内存中缓存区的信息
+           va = diskaddr(blockno);
+           ide_write(0, blockno * SECT2BLK, (void *)va, SECT2BLK);
+       	//为缓存区的映射增加标记位表示修改过
+           syscall_mem_map(0, va, 0, va, (PTE_V | PTE_R | PTE_LIBRARY));
+   }
+   /*对第blockno索引的数据块在虚拟内存中建立缓存页
+    *如果本来就存在缓存,则返回0,否则新建一页缓存,返回映射的虚拟地址
    */
    int map_block(u_int blockno)
    {
@@ -606,9 +677,12 @@ struct Block {
            if (va = block_is_mapped(blockno)) {
                    return 0;
            }
+       	va = disdiskaddr(blockno);
            return syscall_mem_alloc(0,va,PTE_V|PTE_R);
    }
-   
+   /*解除第blockno索引的数据块与内存中缓存块的映射(起始就是将对应虚拟内存解除与物理页的映射)
+    *如果该虚拟内存缓存块是dirty(即被修改过的),则要先写回磁盘中去再解除映射
+   */
    void unmap_block(u_int blockno)
    {
            int r;
@@ -622,6 +696,752 @@ struct Block {
            }
            user_assert(!block_is_mapped(blockno));
    }
+   //释放blockno索引代表的块(实际上只做了将其在位图中对应位置的位置为1表示可用)
+   void free_block(u_int blockno)
+   {
+         	//第一个是boot块不允许释放
+           if (blockno==0) return;
+           //将对应标记位置为1
+           bitmap[blockno/32] = bitmap[blockno/32] && ~(1<<(blockno%32));
+   }
+   //在位图标记中寻找第一个空闲可用的块返回其索引值(在其使用前要将原数据写回)
+   int alloc_block_num(void)
+   {
+           int blockno;
+           for (blockno = 3; blockno < super->s_nblocks; blockno++) {
+                   if (bitmap[blockno / 32] & (1 << (blockno % 32))) { 
+                           bitmap[blockno / 32] &= ~(1 << (blockno % 32));
+           //注意 : 我们在free_block中只是改变了bitmap中的标记位而已,所以真正要使用这个块之前要将其数据写回到磁盘中去(使用write_block来写回)
+                           write_block(blockno / BIT2BLK);
+                           return blockno;
+                   }
+           }
+           return -E_NO_DISK;
+   }
+   /*分配一个可用的数据块返回其索引值,可用的含义如下:
+    1.在位图中标记位为1
+    2.已经将之间的数据写回磁盘中
+    3.在虚拟内存中建立了缓存块映射
+   */
+   int alloc_block(void)
+   {
+           int r, bno;
+           //找到一个空闲的块并将值写回磁盘
+           if ((r = alloc_block_num()) < 0) {
+                   return r;
+           }
+           bno = r;
+       	//建立虚拟内存中的缓存
+           if ((r = map_block(bno)) < 0) {
+                   free_block(bno);
+                   return r;
+           }
+           return bno;
+   }
+   ```
+
+   **注意** :
+
+   * 有关有效位
+     1. `PTE_D` : 
+     2. `PTE_LIBRARY` : 
+
+   * 有关映射
+     1. **磁盘块的索引与虚拟地址中的缓存块地址**二者的映射关系是**确定**的,即按索引从小到大,地址按页小到大来静态映射的
+     2. **我们所说的`map`和`unmap`实质上是建立索引对应的虚拟页映射到一个有效的物理页**,即保证虚拟缓存块是有效的
+
+   * **有关块的释放与获取**
+
+     1. 我们在释放块时只是**做了将其在`bitmap`结构中的对应标记位设置为1**的简单操作
+
+     2. 当要获取一块时,我们要:
+
+        1. 在`bitmap`中找到一个标记为1(可用)的块
+        2. **将其对应的缓存内容写回磁盘中**
+        3. 在虚拟内存中建立缓存块
+
+        **至此该数据块才真正可以被分配使用**
+
+### 对文件系统的操作
+
+注意区分对**一般文件和对目录文件**二者操作的不同
+
+二者的数据结构组织相同,但是**数据的含义**不同
+
+```c
+//fs/fs.c
+//读取超级块内容到缓存区中
+void read_super(void)
+{
+        int r;
+        void *blk;
+        if ((r = read_block(1, &blk, 0)) < 0) {
+                user_panic("cannot read superblock: %e", r);
+        }
+        super = blk;
+        if (super->s_magic != FS_MAGIC) {
+                user_panic("bad file system magic number %x %x", super->s_magic, FS_MAGIC);
+        }
+        if (super->s_nblocks > DISKMAX / BY2BLK) {
+                user_panic("file system is too large");
+        }
+        writef("superblock is good\n");
+}
+//读取位图结构bitmap
+void read_bitmap(void)
+{
+        u_int i;
+        void *blk = NULL;
+//nbitmap代表的是位图结构bitmap占用的数据块的个数(至少为1个)
+        nbitmap = super->s_nblocks / BIT2BLK + 1;
+//将bitmap读入到虚拟内存缓存中
+        for (i = 0; i < nbitmap; i++) {
+                read_block(i + 2, blk, 0);
+        }
+        bitmap = (u_int *)diskaddr(2);
+ //检查bitmap中前两个块(boot和super)和bitmap占用的块必定是已被使用的   	
+        user_assert(!block_is_free(0));
+        user_assert(!block_is_free(1));
+        for (i = 0; i < nbitmap; i++) {
+                user_assert(!block_is_free(i + 2));
+        }
+        writef("read_bitmap is good\n");
+}
+void fs_init(void)
+{
+        read_super();
+        check_write_block();
+        read_bitmap();
+}
+//在文件控制块f中查询第fileno个指针指向的数据块的索引值,ppdiskbno指向保存该索引值的地址
+//alloc为1代表在间接指针无效时允许新分配一页
+int file_block_walk(struct File *f, u_int filebno, u_int **ppdiskbno, u_int alloc)
+{
+        int r;
+        u_int *ptr;
+        void *blk;
+//指针值在直接指针范围内直接通过直接指针获得
+        if (filebno < NDIRECT) {
+                ptr = &f->f_direct[filebno];
+        } else if (filebno < NINDIRECT) {
+        //当指针值需要使用间接指针时
+                if (f->f_indirect == 0) {
+                        if (alloc == 0) {//不允许alloc
+                                return -E_NOT_FOUND;
+                        }
+                        if ((r = alloc_block()) < 0) {//允许alloc则分配一块存储间接指针
+                                return r;
+                        }
+                        f->f_indirect = r;
+                }
+			//blk保存(保存间接指针的虚拟页)的起始地址
+                if ((r = read_block(f->f_indirect, &blk, 0)) < 0) {
+                        return r;
+                }
+            //则ptr指向(保存fileno指针指向的数据块索引)的地址
+            //即*ptr即为fileno指向的数据块的索引值
+                ptr = (u_int *)blk + filebno;
+        } else {
+                return -E_INVAL;
+        }
+        *ppdiskbno = ptr;
+        return 0;
+}
+//在f文件控制块中查找第fileno个指针指向的数据块对应的索引值赋值给diskbno(即建立文件控制块域与数据块关系)
+//当alloc为1时若查找出来的索引无效,允许新分配一块
+int file_map_block(struct File *f, u_int filebno, u_int *diskbno, u_int alloc)
+{
+        int r;
+        u_int *ptr;
+//在f文件控制块中找对应的数据索引
+        if ((r = file_block_walk(f, filebno, &ptr, alloc)) < 0) {
+                return r;
+        }
+//*ptr保存索引值
+//如果索引无效
+        if (*ptr == 0) {
+                if (alloc == 0) {
+                        return -E_NOT_FOUND;
+                }
+			//如果允许分配则新分配一页,并写入控制块结构对应位置
+                if ((r = alloc_block()) < 0) {
+                        return r;
+                }
+            //填入新分配的块的索引
+                *ptr = r;
+        }
+        *diskbno = *ptr;
+        return 0;
+}
+//释放文件控制块f的第filebno个指针指向的数据块
+int file_clear_block(struct File *f, u_int filebno)
+{
+        int r;
+        u_int *ptr;
+        if ((r = file_block_walk(f, filebno, &ptr, 0)) < 0) {
+                return r;
+        }
+        if (*ptr) {
+                free_block(*ptr);
+                *ptr = 0;
+        }
+        return 0;
+}
+//获得文件控制块f中第filebno个指针指向的数据块中的数据加载到虚拟内存中,并令blk指向该虚拟地址
+//当filebno超过索引范围之后,则新分配一个
+int file_get_block(struct File *f, u_int filebno, void **blk)
+{
+        int r;
+        u_int diskbno;
+        u_int isnew;
+    //找到数据块的索引
+        if ((r = file_map_block(f, filebno, &diskbno, 1)) < 0) {
+                return r;
+        }
+    //加载该数据块到虚拟内存blk中
+        if ((r = read_block(diskbno, blk, &isnew)) < 0) {
+                return r;
+        }
+        return 0;
+}
+//???
+int file_dirty(struct File *f, u_int offset)
+{
+        int r;
+        void *blk;
+
+        if ((r = file_get_block(f, offset / BY2BLK, &blk)) < 0) {
+                return r;
+        }
+
+        *(volatile char *)blk = *(volatile char *)blk;
+        return 0;
+}
+//获得目录文件dir之下名为name的文件,如果有则将该文件的文件控制块赋值给file(注意此时dir问name文件的直接父目录)
+int dir_lookup(struct File *dir, char *name, struct File **file)
+{
+        int r;
+        u_int i, j, nblock;
+        void *blk;
+        struct File *f;
+    //nblock为该目录文件之下的数据块个数
+        nblock = ROUND(dir->f_size,BY2BLK)/BY2BLK;
+        for (i = 0; i < nblock; i++) {
+                //获得一个保存文件控制块的数据块
+                if (r=file_get_block(dir,i,&blk))
+                        return r;
+                f = (struct File*)blk;
+                //遍历该块中的每一个文件控制块,比较文件名
+                for (j=0;j<FILE2BLK;j++) {
+                        if (strcmp(f[j].f_name,name)==0) {
+                                f[j].f_dir = dir;
+                                *file = &f[j];
+                                return 0;
+                        }
+                }
+        }
+        return -E_NOT_FOUND;
+}
+//在目录文件dir之下寻找一个空闲的文件控制块,并将其赋值给file
+//如果没有空闲的控制块,则新分配一个数据块用来存储文件控制块
+int dir_alloc_file(struct File *dir, struct File **file)
+{
+        int r;
+        u_int nblock, i , j;
+        void *blk;
+        struct File *f;
+        nblock = dir->f_size / BY2BLK;
+    //遍历每一个块
+        for (i = 0; i < nblock; i++) {
+                if ((r = file_get_block(dir, i, &blk)) < 0) {
+                        return r;
+                }
+                f = blk;
+            //遍历块中的每一个文件控制块
+                for (j = 0; j < FILE2BLK; j++) {
+                        if (f[j].f_name[0] == '\0') { 
+                                *file = &f[j];
+                                return 0;
+                        }
+                }
+        }
+    //当没找到之后新分配一个数据块
+        dir->f_size += BY2BLK;
+        if ((r = file_get_block(dir, i, &blk)) < 0) {
+                return r;
+        }
+        f = blk;
+        *file = &f[0];
+        return 0;
+}
+//去除路径中的空格
+char *skip_slash(char *p)
+{
+        while (*p == '/') {
+                p++;
+        }
+        return p;
+}
+//难道我们不支持文件目录的嵌套吗???
+//返回0代表找到了给文件
+int walk_path(char *path, struct File **pdir, struct File **pfile, char *lastelem)
+{
+        char *p;
+        char name[MAXNAMELEN];
+        struct File *dir, *file;
+        int r;
+
+        // start at the root.
+        path = skip_slash(path);
+        file = &super->s_root;
+        dir = 0;
+        name[0] = 0;
+
+        if (pdir) {
+                *pdir = 0;
+        }
+
+        *pfile = 0;
+
+        // find the target file by name recursively.
+        while (*path != '\0') {
+                dir = file;
+                p = path;
+
+                while (*path != '/' && *path != '\0') {
+                        path++;
+                }
+
+                if (path - p >= MAXNAMELEN) {
+                        return -E_BAD_PATH;
+                }
+
+                user_bcopy(p, name, path - p);
+                name[path - p] = '\0';
+                path = skip_slash(path);
+
+                if (dir->f_type != FTYPE_DIR) {
+                        return -E_NOT_FOUND;
+                }
+
+                if ((r = dir_lookup(dir, name, &file)) < 0) {
+                        if (r == -E_NOT_FOUND && *path == '\0') {
+                                if (pdir) {
+                                        *pdir = dir;
+                                }
+
+                                if (lastelem) {
+                                        strcpy(lastelem, name);
+                                }
+
+                                *pfile = 0;
+                        }
+
+                        return r;
+                }
+        }
+
+        if (pdir) {
+                *pdir = dir;
+        }
+
+        *pfile = file;
+        return 0;
+}
+//根据path找到其代表的文件控制块并赋值给file
+int file_open(char *path, struct File **file)
+{
+        return walk_path(path, 0, file, 0);
+}
+//根据path在目录下创建文件,并将新建的文件控制块赋值给file
+int file_create(char *path, struct File **file)
+{
+        char name[MAXNAMELEN];
+        int r;
+        struct File *dir, *f;
+        if ((r = walk_path(path, &dir, &f, name)) == 0) {
+                return -E_FILE_EXISTS;
+        }
+        if (r != -E_NOT_FOUND || dir == 0) {
+                return r;
+        }
+        if (dir_alloc_file(dir, &f) < 0) {
+                return r;
+        }
+        strcpy((char *)f->f_name, name);
+        *file = f;
+        return 0;
+}
+//将文件控制块f代表的文件的大小截取为newsize(要求newsize < oldsize)(不安全的方法,只能被file_set_size使用)
+void file_truncate(struct File *f, u_int newsize)
+{
+        u_int bno, old_nblocks, new_nblocks;
+        old_nblocks = f->f_size / BY2BLK + 1;
+        new_nblocks = newsize / BY2BLK + 1;
+        if (newsize == 0) {
+                new_nblocks = 0;
+        }
+        if (new_nblocks <= NDIRECT) {//当只需要直接指针时
+                f->f_indirect = 0;
+            //当新的大小比原大小大时,将多余的块释放
+                for (bno = new_nblocks; bno < old_nblocks; bno++) {
+                        file_clear_block(f, bno);
+                }
+        } else {
+                for (bno = new_nblocks; bno < old_nblocks; bno++) {
+                        file_clear_block(f, bno);
+                }
+        }
+        f->f_size = newsize;
+}
+/*将文件的大小改变为newsize
+ *如果newsize < oldsize则截断(使用file_truncate),设置f_size为new_size
+ *如果newsize > oldsize则直接设置f_size为new_size即可
+ *将???
+*/
+int file_set_size(struct File *f, u_int newsize)
+{
+        if (f->f_size > newsize) {
+                file_truncate(f, newsize);
+        }
+
+        f->f_size = newsize;
+
+        if (f->f_dir) {
+                file_flush(f->f_dir);//??????
+        }
+        return 0;
+}
+//将文件控制块f中所有指针指向的数据块中的dirty的写回磁盘中(即同步磁盘与内存缓存中的数据)
+void file_flush(struct File *f)
+{
+        u_int nblocks;
+        u_int bno;
+        u_int diskno;
+        int r;
+
+        nblocks = f->f_size / BY2BLK + 1;
+
+        for (bno = 0; bno < nblocks; bno++) {
+            //获得当前文件第bno个指针对应的索引,当不存在时不新建映射
+                if ((r = file_map_block(f, bno, &diskno, 0)) < 0) {
+                        continue;
+                }
+            //如果由索引获得的数据块是dirty的,则将其刷新回磁盘上
+                if (block_is_dirty(diskno)) {
+                        write_block(diskno);
+                }
+        }
+}
+//该操作是保证数据同步性,即将内存中dirty的快缓存写回到磁盘中
+void fs_sync(void)
+{
+        int i;
+        for (i = 0; i < super->s_nblocks; i++) {
+                if (block_is_dirty(i)) {
+                        write_block(i);
+                }
+        }
+}
+//关闭文件的操作其实就是把文件内容从内存缓存写回磁盘中
+void file_close(struct File *f)
+{
+        file_flush(f);
+        if (f->f_dir) {
+                file_flush(f->f_dir);
+        }
+}
+int file_remove(char *path)
+{
+        int r;
+        struct File *f;
+        if ((r = walk_path(path, 0, &f, 0)) < 0) {
+                return r;
+        }
+        file_truncate(f, 0);
+        f->f_name[0] = '\0';
+        file_flush(f);
+        if (f->f_dir) {
+                file_flush(f->f_dir);
+        }
+        return 0;
+}
+```
+
+**注意**
+
+好像 :
+
+我们所谓的对文件或者目录文件的操作都是针对于在内存缓存区的,而磁盘上的文件结构或者内容不会发生改变,所以我们在每一次的修改之前都会有个写回磁盘的操作???
+
+## 用户接口
+
+在我们实现文件系统之后,我们需要给用户提供**使用的接口(就是一些标准化的操文件系统的函数)**
+
+### 文件描述符
+
+我们引入一个新的数据结构,即文件描述符
+
+1. 定义
+
+   ```c
+   //user/fd.h
+   struct Fd
+   {
+   	u_int fd_dev_id;
+   	u_int fd_offset;
+   	u_int fd_omode;
+   };
+   ```
+
+2. 其在内存中的构成
+
+   ```c
+   //user/fd.c
+   #define MAXFD 32 //最多同时存在32个文件描述符结构
+   #define FILEBASE 0x60000000
+   #define FDTABLE (FILEBASE-PDMAP)
+   ```
+
+   此处应该有个图
+
+   **注意 : 我们一个`Fd`结构体占据一页的大小**
+
+3. 操作
+
+   ```c
+   //user/fd.c
+   int dev_lookup(int dev_id, struct Dev **dev)
+   {
+   	int i;
+   	for (i=0; devtab[i]; i++)
+   		if (devtab[i]->dev_id == dev_id) {
+   			*dev = devtab[i];
+   			return 0;
+   		}
+   	writef("[%08x] unknown device type %d\n", env->env_id, dev_id);
+   	return -E_INVAL;
+   }
+   //找一个还没有映射的页分配给fd结构体
+   int fd_alloc(struct Fd **fd)
+   {
+   	u_int va;
+   	u_int fdno;
+   	for(fdno = 0;fdno < MAXFD - 1;fdno++)
+   	{
+   		va = INDEX2FD(fdno);
+   		//页目录无效说明该页还没有映射
+   		if(((* vpd)[va/PDMAP] & PTE_V)==0)
+   		{
+   			*fd = va;
+   		return 0;
+   		}
+   		//页表项无效说明该页还没有映射
+   		if(((* vpt)[va/BY2PG] & PTE_V)==0)		
+   		{
+   			*fd = va;
+   			return 0;
+   		}
+       }
+   	return -E_MAX_OPEN;
+   }
+   //去除fd所在页的映射,即删除这个文件描述符
+   void fd_close(struct Fd *fd)
+   {
+   	syscall_mem_unmap(0, (u_int)fd);
+   }
+   //将第fdnum个文件描述符的地址(如果有效)赋值给fd
+   int fd_lookup(int fdnum, struct Fd **fd)
+   {
+   	u_int va;
+   	if(fdnum >=MAXFD)
+   		return -E_INVAL;
+   	va = INDEX2FD(fdnum);//获得第fdnum个fd文件描述符的地址
+   	if(((* vpt)[va/BY2PG] & PTE_V)!=0)		
+   	{//该地址有效则赋值给fd
+   		*fd = va;
+   		return 0;
+   	}
+   	return -E_INVAL;
+   }
+   
+   u_int fd2data(struct Fd *fd)
+   {
+   	return INDEX2DATA(fd2num(fd));
+   }
+   
+   int fd2num(struct Fd *fd)
+   {
+   	return ((u_int)fd - FDTABLE)/BY2PG;
+   }
+   int num2fd(int fd)
+   {
+   	return fd*BY2PG+FDTABLE;
+   }
+   
+   int close(int fdnum)
+   {
+   	int r;
+   	struct Dev *dev;
+   	struct Fd *fd;
+   
+   	if ((r = fd_lookup(fdnum, &fd)) < 0
+   	||  (r = dev_lookup(fd->fd_dev_id, &dev)) < 0)
+   		return r;
+   	r = (*dev->dev_close)(fd);
+   	fd_close(fd);
+   	return r;
+   }
+   
+   void close_all(void)
+   {
+   	int i;
+   
+   	for (i=0; i<MAXFD; i++)
+   		close(i);
+   }
+   
+   int dup(int oldfdnum, int newfdnum)
+   {
+   	int i, r;
+   	u_int ova, nva, pte;
+   	struct Fd *oldfd, *newfd;
+   	
+   	if ((r = fd_lookup(oldfdnum, &oldfd)) < 0)
+   		return r;
+   	close(newfdnum);
+   
+   	newfd = (struct Fd*)INDEX2FD(newfdnum);
+   	ova = fd2data(oldfd);
+   	nva = fd2data(newfd);
+   
+   	if ((* vpd)[PDX(ova)]) {
+   		for (i=0; i<PDMAP; i+=BY2PG) {
+   			pte = (* vpt)[VPN(ova+i)];
+   			if(pte&PTE_V) {
+   				// should be no error here -- pd is already allocated
+   				if ((r = syscall_mem_map(0, ova+i, 0, nva+i, pte&(PTE_V|PTE_R|PTE_LIBRARY))) < 0)
+   					goto err;
+   			}
+   		}
+   	}
+   
+   	if ((r = syscall_mem_map(0, (u_int)oldfd, 0, (u_int)newfd, ((*vpt)[VPN(oldfd)])&(PTE_V|PTE_R|PTE_LIBRARY))) < 0)
+   		goto err;
+   
+   	return newfdnum;
+   
+   err:
+   	syscall_mem_unmap(0, (u_int)newfd);
+   	for (i=0; i<PDMAP; i+=BY2PG)
+   		syscall_mem_unmap(0, nva+i);
+   	return r;
+   }
+   
+   int read(int fdnum, void *buf, u_int n)
+   {
+   	int r;
+   	struct Dev *dev;
+   	struct Fd *fd;
+   	//writef("read() come 1 %x\n",(int)env);
+   	if ((r = fd_lookup(fdnum, &fd)) < 0
+   	||  (r = dev_lookup(fd->fd_dev_id, &dev)) < 0)
+   		return r;
+   	//writef("read() come 2 %x\n",(int)env);
+   	if ((fd->fd_omode & O_ACCMODE) == O_WRONLY) {
+   		writef("[%08x] read %d -- bad mode\n", env->env_id, fdnum); 
+   		return -E_INVAL;
+   	}
+   	//writef("read() come 3 %x\n",(int)env);
+   	r = (*dev->dev_read)(fd, buf, n, fd->fd_offset);
+   	if (r >= 0)
+   		fd->fd_offset += r;
+   	//writef("read() come 4 %x\n",(int)env);
+   	return r;
+   }
+   
+   int
+   readn(int fdnum, void *buf, u_int n)
+   {
+   	int m, tot;
+   
+   	for (tot=0; tot<n; tot+=m) {
+   		m = read(fdnum, (char*)buf+tot, n-tot);
+   		if (m < 0)
+   			return m;
+   		if (m == 0)
+   			break;
+   	}
+   	return tot;
+   }
+   
+   int write(int fdnum, const void *buf, u_int n)
+   {
+   	int r;
+   	struct Dev *dev;
+   	struct Fd *fd;
+   	//writef("write comes 1\n");
+   	if ((r = fd_lookup(fdnum, &fd)) < 0
+   	||  (r = dev_lookup(fd->fd_dev_id, &dev)) < 0)
+   		return r;
+   //writef("write comes 2\n");
+   	if ((fd->fd_omode & O_ACCMODE) == O_RDONLY) {
+   		writef("[%08x] write %d -- bad mode\n", env->env_id, fdnum);
+   		return -E_INVAL;
+   	}
+   //writef("write comes 3\n");
+   	if (debug) writef("write %d %p %d via dev %s\n",
+   		fdnum, buf, n, dev->dev_name);
+   	r = (*dev->dev_write)(fd, buf, n, fd->fd_offset);
+   	if (r > 0)
+   		fd->fd_offset += r;
+   //writef("write comes 4\n");
+   	return r;
+   }
+   
+   int seek(int fdnum, u_int offset)
+   {
+   	int r;
+   	struct Fd *fd;
+   	//writef("seek() come 1 %x\n",(int)env);
+   	if ((r = fd_lookup(fdnum, &fd)) < 0)
+   		return r;
+   	//writef("seek() come 2 %x\n",(int)env);
+   	fd->fd_offset = offset;
+   	//writef("seek() come 3 %x\n",(int)env);
+   	return 0;
+   }
+   
+   
+   int fstat(int fdnum, struct Stat *stat)
+   {
+   	int r;
+   	struct Dev *dev;
+   	struct Fd *fd;
+   
+   	if ((r = fd_lookup(fdnum, &fd)) < 0
+   	||  (r = dev_lookup(fd->fd_dev_id, &dev)) < 0)
+   		return r;
+   	stat->st_name[0] = 0;
+   	stat->st_size = 0;
+   	stat->st_isdir = 0;
+   	stat->st_dev = dev;
+   	return (*dev->dev_stat)(fd, stat);
+   }
+   
+   int stat(const char *path, struct Stat *stat)
+   {
+   	int fd, r;
+   
+   	if ((fd = open(path, O_RDONLY)) < 0)
+   		return fd;
+   	r = fstat(fd, stat);
+   	close(fd);
+   	return r;
+   }
    ```
 
    
+
+
+
